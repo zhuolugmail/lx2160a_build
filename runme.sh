@@ -161,11 +161,11 @@ esac
 case "${DISTRO}" in
 	ubuntu)
 		ROOTFS=ubuntu-core
-		ROOTFS_SIZE=350M
+		ROOTFS_SIZE=550M
 	;;
 	debian)
 		ROOTFS=debian-bullseye
-		ROOTFS_SIZE=350M
+		ROOTFS_SIZE=550M
 	;;
 	*)
 		echo "Please use one of the supported distros"
@@ -306,10 +306,66 @@ case "\$1" in
 esac
 EOF
 	chmod +x overlay/etc/init.d/S99bootstrap-ubuntu.sh
+
+	# Building DPDK
+	# Build tmp root fs for DPDK
+
+	echo "Building rootfs for DPDK"
+	mkdir -p $ROOTDIR/build/dpdk_root
+	cd $ROOTDIR/build/dpdk_root
+	if [ ! -d buildroot ]; then
+		git clone $SHALLOW_FLAG https://github.com/buildroot/buildroot -b $BUILDROOT_VERSION
+	fi
+	cd buildroot
+	mkdir -p overlay/etc/init.d/
+	if [ $UID -eq 0 ]; then
+		export FORCE_UNSAFE_CONFIGURE=1
+	fi
+	cp $ROOTDIR/configs/buildroot/lx2160acex7_defconfig configs/
+	printf 'BR2_PRIMARY_SITE="%s"\n' "${BR2_PRIMARY_SITE}" >> configs/lx2160acex7_defconfig
+	make lx2160acex7_defconfig
+	make
+
+	cd $ROOTDIR/build/dpdk
+	echo "Building DPDK"
+
+	export CROSS=$CROSS_COMPILE
+	export RTE_SDK=$ROOTDIR/build/dpdk
+	export DESTDIR=$ROOTDIR/build/ubuntu/buildroot/overlay
+	export RTE_TARGET=arm64-dpaa-linuxapp-gcc
+
+	RFSDIR=$ROOTDIR/build/dpdk_root/buildroot/output/target
+	KERNEL_PATH=$ROOTDIR/build/dpdk_root/buildroot/output/build/linux-5.4.31
+	DPDK_BUILD_DIR=arm64-dpaa-build
+
+	mkdir -p $DESTDIR/usr/local/lib
+	cp $RFSDIR/usr/lib/libcrypto.so* $DESTDIR/usr/local/lib
+	# export PKG_CONFIG_PATH=$RFSDIR/lib/pkgconfig:$PKG_CONFIG_PATH
+	# export PKG_CONFIG_SYSROOT_DIR=$RFSDIR
+
+	DPDK_EXAMPLES="l2fwd,l3fwd,l2fwd-qdma,ip_fragmentation,ip_reassembly,qdma_demo,ethtool,link_status_interrupt,multi_process/symmetric_mp,multi_process/simple_mp,multi_process/symmetric_mp_qdma,kni,qos_sched,multi_process/client_server_mp/mp_server,multi_process/client_server_mp/mp_client,l3fwd-power,l2fwd-event"
+
+	meson $DPDK_BUILD_DIR --prefix=/usr/local --buildtype=release -Denable_kmods=true -Dkernel_dir=$KERNEL_PATH -Dexamples=$DPDK_EXAMPLES -Dc_args="-Ofast -fPIC -ftls-model=local-dynamic -I$DESTDIR/usr/local/include" -Doptimization=3 --cross-file=config/arm/arm64_dpaa_linux_gcc
+	ninja -C $DPDK_BUILD_DIR install
+
+	cd $DPDK_BUILD_DIR/examples
+	find . -perm -111 -a -type f | xargs -I {} cp {} $DESTDIR/usr/local/bin
+	cd -
+	mkdir -p $DESTDIR/usr/local/dpdk
+	cp -rf nxp/* $DESTDIR/usr/local/dpdk
+	cp -t $DESTDIR/usr/local/include config/rte_config.h $DPDK_BUILD_DIR/rte_build_config.h lib/librte_mempool/rte_*.h lib/librte_ethdev/rte_*.h lib/librte_cryptodev/rte_*.h lib/librte_ring/rte_*.h lib/librte_mbuf/rte_mbuf.h lib/librte_eal/linux/include/rte_*.h
+	cp -rf lib/librte_eal/include/generic $DESTDIR/usr/local/include
+	cp -f $DPDK_BUILD_DIR/kernel/linux/kni/rte_kni.ko $DESTDIR/usr/local/dpdk
+	rm -rf $DESTDIR/usr/local/share/dpdk/examples
+
+	echo "Finished DPDK"
+	cd $ROOTDIR/build/ubuntu/buildroot
+	# End of building DPDK
+	
 	make
 	IMG=ubuntu-core.ext4.tmp
 	truncate -s $ROOTFS_SIZE $IMG
-	qemu-system-aarch64 -m 1G -M virt -cpu cortex-a57 -nographic -smp 1 -kernel output/images/Image -append "console=ttyAMA0" -netdev user,id=eth0 -device virtio-net-device,netdev=eth0 -initrd output/images/rootfs.cpio.gz -drive file=$IMG,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -no-reboot
+	qemu-system-aarch64 -m 1500M -M virt -cpu cortex-a57 -nographic -smp 1 -kernel output/images/Image -append "console=ttyAMA0" -netdev user,id=eth0 -device virtio-net-device,netdev=eth0 -initrd output/images/rootfs.cpio.gz -drive file=$IMG,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -no-reboot
 	mv $IMG $ROOTDIR/build/ubuntu-core.ext4
 fi
 
@@ -368,7 +424,7 @@ EOF
 	chmod +x overlay/etc/init.d/S99bootstrap-debian.sh
 	make
 	IMG=debian-bullseye.ext4.tmp
-	truncate -s 350M $IMG
+	truncate -s $ROOTFS_SIZE $IMG
 	qemu-system-aarch64 -m 1G -M virt -cpu cortex-a57 -nographic -smp 1 -kernel output/images/Image -append "console=ttyAMA0" -netdev user,id=eth0 -device virtio-net-device,netdev=eth0 -initrd output/images/rootfs.cpio.gz -drive file=$IMG,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -no-reboot
 	mv $IMG $ROOTDIR/build/debian-bullseye.ext4
 fi
@@ -528,14 +584,14 @@ cp $ROOTDIR/build/linux/arch/arm64/boot/dts/freescale/fsl-lx216*.dtb $ROOTDIR/im
 
 
 
-echo "Building DPDK"
-cd $ROOTDIR/build/dpdk
-export CROSS=$CROSS_COMPILE
-export RTE_SDK=$ROOTDIR/build/dpdk
-export DESTDIR=$ROOTDIR/build/dpdk/install
-export RTE_TARGET=arm64-dpaa-linuxapp-gcc
-meson arm64-dpaa-build -Dexamples=all --cross-file config/arm/arm64_dpaa_linux_gcc
-ninja -C arm64-dpaa-build
+# echo "Building DPDK"
+# cd $ROOTDIR/build/dpdk
+# export CROSS=$CROSS_COMPILE
+# export RTE_SDK=$ROOTDIR/build/dpdk
+# export DESTDIR=$ROOTDIR/build/dpdk/install
+# export RTE_TARGET=arm64-dpaa-linuxapp-gcc
+# meson arm64-dpaa-build -Dexamples=all --cross-file config/arm/arm64_dpaa_linux_gcc
+# ninja -C arm64-dpaa-build
 
 
 ###############################################################################
@@ -588,8 +644,8 @@ e2ln images/tmp/$ROOTFS.ext4:/usr/bin/ls-main /usr/bin/ls-addsw
 e2ln images/tmp/$ROOTFS.ext4:/usr/bin/ls-main /usr/bin/ls-listmac
 e2ln images/tmp/$ROOTFS.ext4:/usr/bin/ls-main /usr/bin/ls-listni
 
-truncate -s 420M $ROOTDIR/images/tmp/$ROOTFS.img
-parted --script $ROOTDIR/images/tmp/$ROOTFS.img mklabel msdos mkpart primary 64MiB 417MiB
+truncate -s 620M $ROOTDIR/images/tmp/$ROOTFS.img
+parted --script $ROOTDIR/images/tmp/$ROOTFS.img mklabel msdos mkpart primary 64MiB 617MiB
 # Generate the above partuuid 3030303030 which is the 4 characters of '0' in ascii
 echo "0000" | dd of=$ROOTDIR/images/tmp/$ROOTFS.img bs=1 seek=440 conv=notrunc
 dd if=$ROOTDIR/images/tmp/$ROOTFS.ext4 of=$ROOTDIR/images/tmp/$ROOTFS.img bs=1M seek=64 conv=notrunc
@@ -598,10 +654,10 @@ echo "Assembling Boot Image"
 cd $ROOTDIR/
 IMG=lx2160acex7_${SPEED}_${SERDES}-${REPO_PREFIX}.img
 rm -rf $ROOTDIR/images/${IMG}
-truncate -s 528M $ROOTDIR/images/${IMG}
+truncate -s 728M $ROOTDIR/images/${IMG}
 #dd if=/dev/zero of=$ROOTDIR/images/${IMG} bs=1M count=1
-parted --script $ROOTDIR/images/${IMG} mklabel msdos mkpart primary 64MiB 527MiB
-truncate -s 463M $ROOTDIR/images/tmp/boot.part
+parted --script $ROOTDIR/images/${IMG} mklabel msdos mkpart primary 64MiB 727MiB
+truncate -s 663M $ROOTDIR/images/tmp/boot.part
 mkfs.ext4 -b 4096 -F $ROOTDIR/images/tmp/boot.part
 \rm -rf $ROOTDIR/images/tmp/xspi_header.img
 truncate -s 128K $ROOTDIR/images/tmp/xspi_header.img
